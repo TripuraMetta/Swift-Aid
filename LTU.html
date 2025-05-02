@@ -1,0 +1,239 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Real-Time Ambulance Tracking</title>
+    
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet/dist/leaflet.css" />
+    <link rel="stylesheet" href="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.css" />
+    
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet/dist/leaflet.js"></script>
+    <script src="https://unpkg.com/leaflet-routing-machine/dist/leaflet-routing-machine.js"></script>
+    
+    <style>
+        body, html { margin: 0; padding: 0; height: 100%; width: 100%; }
+        #map { height: 100vh; width: 100%; }
+        
+        /* Top-left info */
+        #info-left { position: absolute; top: 10px; left: 10px; background: white; padding: 10px; z-index: 1000; border-radius: 5px; }
+
+        /* Top-right info */
+        #info-right { position: absolute; top: 10px; right: 10px; background: white; padding: 10px; z-index: 1000; border-radius: 5px; }
+        
+        /* Direction icons */
+        .direction-icon { font-size: 20px; }
+    </style>
+</head>
+<body>
+    
+    <!-- Top-left info (remaining distance and time) -->
+    <div id="info-left">
+        <b>Click on the map to set an incident location...</b><br>
+        <span id="remainingDistance">Remaining Distance: -- km</span><br>
+        <span id="remainingTime">Remaining Time: -- mins</span>
+    </div>
+    
+    <!-- Top-right info (total distance, total time, and directions) -->
+    <div id="info-right">
+        <span id="totalDistance">Total Distance: -- km</span><br>
+        <span id="totalTime">Total Time: -- mins</span><br>
+        <span id="direction">Direction: </span><br>
+        <span id="direction-arrow" class="direction-icon">⬆</span> <!-- Default: North -->
+    </div>
+    
+    <div id="map"></div>
+    
+    <script>
+        var map = L.map('map').setView([16.5062, 80.6480], 13);
+        
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '&copy; OpenStreetMap contributors'
+        }).addTo(map);
+
+        var incidentMarker, ambulanceMarker, routingControl, moveInterval;
+        var totalDistance = 0, totalTime = 0, remainingDistance, remainingTime;
+        var lastDirection = null;
+
+        var ambulanceIcon = L.icon({
+            iconUrl: "https://img.icons8.com/color/48/ambulance.png",
+            iconSize: [35, 35], 
+            iconAnchor: [17, 35]
+        });
+
+        map.on('click', function(e) {
+            if (incidentMarker) map.removeLayer(incidentMarker);
+            incidentMarker = L.marker(e.latlng).addTo(map).bindPopup("🚨 Incident Location").openPopup();
+            findNearestHospital(e.latlng);
+        });
+
+        function updateRemainingValues() {
+            document.getElementById('remainingDistance').innerText = `Remaining Distance: ${remainingDistance.toFixed(2)} km`;
+            document.getElementById('remainingTime').innerText = `Remaining Time: ${remainingTime.toFixed(1)} mins`;
+        }
+
+        function updateTotalValues() {
+            document.getElementById('totalDistance').innerText = `Total Distance: ${totalDistance.toFixed(2)} km`;
+            document.getElementById('totalTime').innerText = `Total Time: ${totalTime.toFixed(1)} mins`;
+        }
+
+        function updateDirectionIcon(direction) {
+            let arrow;
+            switch(direction) {
+                case 'north':
+                    arrow = '⬆';
+                    break;
+                case 'south':
+                    arrow = '⬇';
+                    break;
+                case 'east':
+                    arrow = '➡';
+                    break;
+                case 'west':
+                    arrow = '⬅';
+                    break;
+                default:
+                    arrow = '⬆';
+                    break;
+            }
+            document.getElementById('direction-arrow').innerText = arrow;
+        }
+
+        function findNearestHospital(incidentLocation) {
+            let lat = incidentLocation.lat, lng = incidentLocation.lng;
+            var query = `[out:json];node["amenity"="hospital"](around:25000,${lat},${lng});out;`;
+            var url = `https://overpass-api.de/api/interpreter?data=${encodeURIComponent(query)}`;
+            
+            fetch(url)
+                .then(response => response.json())
+                .then(data => {
+                    var hospitals = data.elements;
+                    if (hospitals.length === 0) {
+                        alert("No hospitals found within 25km!");
+                        return;
+                    }
+                    let nearest = hospitals.reduce((nearest, hospital) => {
+                        let dist = getDistance(lat, lng, hospital.lat, hospital.lon);
+                        return dist < nearest.dist ? { hospital, dist } : nearest;
+                    }, { dist: Infinity });
+                    
+                    startAmbulance(incidentLocation, nearest.hospital);
+                })
+                .catch(error => console.error("Error fetching hospitals:", error));
+        }
+
+        function getDistance(lat1, lon1, lat2, lon2) {
+            var R = 6371; // Earth radius in km
+            var dLat = (lat2 - lat1) * Math.PI / 180;
+            var dLon = (lon2 - lon1) * Math.PI / 180;
+            var a = Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+                    Math.cos(lat1 * Math.PI / 180) * Math.cos(lat2 * Math.PI / 180) *
+                    Math.sin(dLon / 2) * Math.sin(dLon / 2);
+            var c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+            return R * c;
+        }
+
+        function startAmbulance(incidentLocation, hospital) {
+            if (routingControl) map.removeControl(routingControl);
+            if (ambulanceMarker) map.removeLayer(ambulanceMarker);
+            if (moveInterval) clearInterval(moveInterval);
+
+            ambulanceMarker = L.marker([incidentLocation.lat, incidentLocation.lng], { icon: ambulanceIcon }).addTo(map);
+            map.setView([incidentLocation.lat, incidentLocation.lng], 14);
+            
+            let url = `https://router.project-osrm.org/route/v1/driving/${incidentLocation.lng},${incidentLocation.lat};${hospital.lon},${hospital.lat}?overview=full&geometries=geojson`;
+            
+            fetch(url)
+                .then(response => response.json())
+                .then(data => {
+                    let route = data.routes[0].geometry.coordinates;
+                    totalDistance = data.routes[0].distance / 1000;
+                    totalTime = data.routes[0].duration / 60;
+                    
+                    remainingDistance = totalDistance;
+                    remainingTime = totalTime;
+                    
+                    L.geoJSON({ type: "LineString", coordinates: route }, { color: 'red' }).addTo(map);
+                    updateRemainingValues();
+                    updateTotalValues();
+                    moveAmbulance(route);
+                });
+        }
+
+        function moveAmbulance(route) {
+            let index = 0;
+            let totalSteps = route.length;
+            let lastLat = route[0][1];
+            let lastLng = route[0][0];
+            let traveledDistance = 0; // Distance traveled for directional change messages
+            
+            function moveStep() {
+                if (index < totalSteps) {
+                    let [lng, lat] = route[index];
+                    ambulanceMarker.setLatLng([lat, lng]);
+                    remainingDistance = (totalDistance * (totalSteps - index) / totalSteps);
+                    remainingTime = (totalTime * (totalSteps - index) / totalSteps);
+                    updateRemainingValues();
+
+                    // Calculate distance traveled so far
+                    traveledDistance += getDistance(lastLat, lastLng, lat, lng);
+                    
+                    // Determine direction and check if there was a turn
+                    if (index > 0) {
+                        let prevPoint = route[index - 1];
+                        let direction = getDirection(prevPoint[1], prevPoint[0], lat, lng);
+                        
+                        // Check if there is a turn
+                        if (direction !== lastDirection) {
+                            updateDirectionIcon(direction);
+                            lastDirection = direction;
+                            displayTurnMessage(direction, traveledDistance);
+                            traveledDistance = 0; // Reset the traveled distance after a turn
+                        }
+                    }
+
+                    lastLat = lat;
+                    lastLng = lng;
+
+                    index++;
+                    moveInterval = setTimeout(moveStep, 1000);
+                } else {
+                    ambulanceMarker.setLatLng(route[totalSteps - 1].reverse());
+                    alert("🚑 Ambulance has reached the hospital!");
+                }
+            }
+            moveStep();
+        }
+
+        function displayTurnMessage(direction, traveledDistance) {
+            let turnMessage = '';
+            if (direction === 'east') {
+                turnMessage = `Turned right after traveling ${traveledDistance.toFixed(2)} km`;
+            } else if (direction === 'west') {
+                turnMessage = `Turned left after traveling ${traveledDistance.toFixed(2)} km`;
+            }
+
+            // Display the turn message on the screen
+            let directionMessage = document.createElement('div');
+            directionMessage.innerHTML = turnMessage;
+            document.getElementById('info-right').appendChild(directionMessage);
+            
+            // Remove message after 10 seconds
+            setTimeout(() => {
+                directionMessage.remove();
+            }, 10000);
+        }
+
+        function getDirection(lat1, lon1, lat2, lon2) {
+            // Simple calculation to determine direction
+            let angle = Math.atan2(lat2 - lat1, lon2 - lon1) * 180 / Math.PI;
+            if (angle >= -45 && angle < 45) return 'north';  // North
+            if (angle >= 45 && angle < 135) return 'east';   // East
+            if (angle >= 135 || angle < -135) return 'south'; // South
+            return 'west';  // West
+        }
+    </script>
+</body>
+</html>
